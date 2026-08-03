@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>经营看板数据更新</title>
+  <meta name="robots" content="noindex,nofollow" />
+  <link rel="icon" href="./favicon.svg" />
+  <link rel="stylesheet" href="./admin.css" />
+</head>
+<body>
+  <header class="admin-hero">
+    <div class="shell hero-row">
+      <div><div class="eyebrow">FEELINGME · 管理工具</div><h1>经营看板数据更新</h1><p>上传同格式订单表，在本机完成识别、校验与匿名化，再更新公开看板。</p></div>
+      <a class="back" href="./">返回经营看板</a>
+    </div>
+  </header>
+
+  <main class="shell admin-main">
+    <section class="privacy"><strong>原始数据不会上传</strong><span>Excel只在当前浏览器中处理；提交到GitHub的文件已移除原始用户ID和本机文件路径。</span></section>
+
+    <section class="step-card">
+      <div class="step-head"><span>01</span><div><h2>选择最新订单表</h2><p>请上传与“截止26年8月数据表”列结构一致的完整数据，系统会用最新文件整体替换看板数据。</p></div></div>
+      <label class="drop-zone" id="dropZone">
+        <input id="fileInput" type="file" accept=".xlsx,.xls" />
+        <span class="upload-mark">↑</span>
+        <strong id="fileLabel">点击选择Excel，或拖到这里</strong>
+        <small>建议文件名包含最新截止日期；只读取第一个工作表</small>
+      </label>
+      <div id="parseStatus" class="status hidden"></div>
+    </section>
+
+    <section id="resultSection" class="step-card hidden">
+      <div class="step-head"><span>02</span><div><h2>核对处理结果</h2><p>发布前请确认日期范围、订单数、GMV和待确认订单。</p></div></div>
+      <div id="summaryCards" class="summary-grid"></div>
+      <div id="pendingBlock" class="pending-block hidden">
+        <div class="pending-title"><div><strong>存在待确认订单</strong><p>为每种商品选择1V1或1V2后，系统会记住该规则并重新计算。</p></div><span id="pendingCount"></span></div>
+        <div class="table-wrap"><table><thead><tr><th>商品</th><th>实付</th><th>权益</th><th>订单数</th><th>判断依据</th><th>确认标签</th></tr></thead><tbody id="pendingRows"></tbody></table></div>
+      </div>
+      <div id="readyBlock" class="ready hidden"><strong>✓ 数据校验完成，可以发布</strong><span>当前没有8月待确认的有效订单。</span></div>
+      <div class="actions"><button id="downloadButton" class="secondary" disabled>下载匿名化数据</button></div>
+    </section>
+
+    <section id="publishSection" class="step-card hidden">
+      <div class="step-head"><span>03</span><div><h2>更新GitHub Pages</h2><p>首次设置后，每天只需上传Excel并点击一次发布。访问令牌仅保存在本次页面内存中。</p></div></div>
+      <div class="github-note"><strong>首次使用需要GitHub令牌</strong><span>创建Fine-grained token时，仅授权看板仓库，并将“Contents”设为“Read and write”。</span><a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noreferrer">前往GitHub创建令牌 ↗</a></div>
+      <div class="form-grid">
+        <label><span>GitHub用户名</span><input id="ownerInput" placeholder="例如 yourname" autocomplete="username" /></label>
+        <label><span>仓库名称</span><input id="repoInput" value="fml-999-dashboard" /></label>
+        <label><span>分支</span><input id="branchInput" value="main" /></label>
+        <label class="token-field"><span>Fine-grained token</span><input id="tokenInput" type="password" placeholder="github_pat_…" autocomplete="off" /></label>
+      </div>
+      <div class="actions"><button id="publishButton" class="primary" disabled>发布最新数据</button></div>
+      <div id="publishStatus" class="status hidden"></div>
+    </section>
+  </main>
+
+  <script src="./vendor/xlsx.full.min.js"></script>
+  <script type="module" src="./admin.js"></script>
+</body>
+</html>
