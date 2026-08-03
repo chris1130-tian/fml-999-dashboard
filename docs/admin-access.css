@@ -1,0 +1,5 @@
+.data-unlock { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: end; margin-bottom: 16px; padding: 15px; border-radius: 12px; background: #f1f5f5; }
+.data-unlock label span { display: block; margin-bottom: 6px; color: #73808a; font-size: 11px; }
+.data-unlock input { width: 100%; padding: 11px 12px; border: 1px solid #cbc7bd; border-radius: 9px; background: white; font: inherit; }
+.data-unlock button { min-height: 42px; }
+@media (max-width: 600px) { .data-unlock { grid-template-columns: 1fr; } }

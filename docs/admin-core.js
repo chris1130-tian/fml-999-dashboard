@@ -173,3 +173,33 @@ export function buildDashboardData(parsed, storeStatus, overrides = {}) {
   };
   return { payload, summary, pending: Array.from(pendingMap.values()) };
 }
+
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunk) binary += String.fromCharCode(...bytes.subarray(index, index + chunk));
+  return btoa(binary);
+}
+
+function base64ToBytes(value) {
+  const binary = atob(value);
+  return Uint8Array.from(binary, character => character.charCodeAt(0));
+}
+
+export async function encryptDashboardData(payload, password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const iterations = 250000;
+  const compressed = await new Response(new Blob([JSON.stringify(payload)]).stream().pipeThrough(new CompressionStream("gzip"))).arrayBuffer();
+  const material = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations, hash: "SHA-256" }, material, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, compressed);
+  return { v: 1, iterations, salt: bytesToBase64(salt), iv: bytesToBase64(iv), compression: "gzip", data: bytesToBase64(new Uint8Array(encrypted)) };
+}
+
+export async function decryptDashboardData(envelope, password) {
+  const material = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveKey"]);
+  const key = await crypto.subtle.deriveKey({ name: "PBKDF2", salt: base64ToBytes(envelope.salt), iterations: envelope.iterations, hash: "SHA-256" }, material, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+  const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: base64ToBytes(envelope.iv) }, key, base64ToBytes(envelope.data));
+  return JSON.parse(await new Response(new Blob([decrypted]).stream().pipeThrough(new DecompressionStream("gzip"))).text());
+}

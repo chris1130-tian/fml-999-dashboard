@@ -1,4 +1,4 @@
-import { parseOrderWorkbook, buildDashboardData } from "./admin-core.js";
+import { parseOrderWorkbook, buildDashboardData, encryptDashboardData, decryptDashboardData } from "./admin-core.js";
 
 const $ = (id) => document.getElementById(id);
 const number = new Intl.NumberFormat("zh-CN");
@@ -60,6 +60,10 @@ function recalculate() {
 
 async function handleFile(file) {
   if (!file) return;
+  if (!state.storeStatus) {
+    setStatus($("parseStatus"), "请先输入当前看板访问密码并完成验证。", "error");
+    return;
+  }
   $("fileLabel").textContent = file.name;
   setStatus($("parseStatus"), "正在读取并校验Excel，请稍候…");
   $("resultSection").classList.add("hidden");
@@ -100,7 +104,9 @@ async function publish() {
   const repo = $("repoInput").value.trim();
   const branch = $("branchInput").value.trim() || "main";
   const token = $("tokenInput").value.trim();
+  const dataPassword = $("dataPasswordInput").value;
   if (!owner || !repo || !token) return setStatus($("publishStatus"), "请填写GitHub用户名、仓库名称和令牌。", "error");
+  if (!dataPassword) return setStatus($("publishStatus"), "请填写当前看板访问密码。", "error");
   if (!state.result || state.result.pending.length) return setStatus($("publishStatus"), "请先上传数据并完成全部待确认订单。", "error");
   localStorage.setItem("fml-github-owner", owner);
   localStorage.setItem("fml-github-repo", repo);
@@ -108,13 +114,14 @@ async function publish() {
   $("publishButton").disabled = true;
   setStatus($("publishStatus"), "正在连接GitHub并更新看板数据…");
   try {
-    const path = "docs/dashboard-data.json";
+    const path = "docs/dashboard-data.enc.json";
     const base = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}`;
     let sha = null;
     const existingResponse = await fetch(`${base}?ref=${encodeURIComponent(branch)}`, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": "2022-11-28" } });
     if (existingResponse.ok) sha = (await existingResponse.json()).sha;
     else if (existingResponse.status !== 404) throw new Error((await existingResponse.json().catch(() => ({}))).message || `无法读取现有数据文件（${existingResponse.status}）`);
-    const body = { message: `更新经营看板数据至 ${state.result.summary.dateMax.slice(0, 10)}`, content: utf8Base64(JSON.stringify(state.result.payload)), branch };
+    const encryptedPayload = await encryptDashboardData(state.result.payload, dataPassword);
+    const body = { message: `更新加密经营看板数据至 ${state.result.summary.dateMax.slice(0, 10)}`, content: utf8Base64(JSON.stringify(encryptedPayload)), branch };
     if (sha) body.sha = sha;
     await githubRequest(base, token, { method: "PUT", body: JSON.stringify(body) });
     $("tokenInput").value = "";
@@ -128,27 +135,47 @@ async function publish() {
 
 function downloadData() {
   if (!state.result || state.result.pending.length) return;
-  const blob = new Blob([JSON.stringify(state.result.payload)], { type: "application/json" });
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
-  link.download = `dashboard-data-${state.result.summary.dateMax.slice(0, 10)}.json`;
-  link.click();
-  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  const password = $("dataPasswordInput").value;
+  if (!password) return setStatus($("parseStatus"), "请先输入当前看板访问密码。", "error");
+  encryptDashboardData(state.result.payload, password).then(envelope => {
+    const blob = new Blob([JSON.stringify(envelope)], { type: "application/json" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `dashboard-data-${state.result.summary.dateMax.slice(0, 10)}.enc.json`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  });
+}
+
+async function unlockCurrentData() {
+  const password = $("dataPasswordInput").value;
+  if (!password) return setStatus($("unlockStatus"), "请输入当前看板访问密码。", "error");
+  $("unlockDataButton").disabled = true;
+  setStatus($("unlockStatus"), "正在验证密码并读取营业门店表…");
+  try {
+    const envelope = await fetch("./dashboard-data.enc.json", { cache: "no-store" }).then(response => {
+      if (!response.ok) throw new Error("加密数据文件加载失败");
+      return response.json();
+    });
+    const current = await decryptDashboardData(envelope, password);
+    state.storeStatus = current.storeStatus;
+    setStatus($("unlockStatus"), `密码验证成功，已读取${current.storeStatus.stores.filter(row => row.operating).length}家营业中门店。`, "success");
+  } catch {
+    state.storeStatus = null;
+    setStatus($("unlockStatus"), "密码不正确，请重新输入。", "error");
+  } finally {
+    $("unlockDataButton").disabled = false;
+  }
 }
 
 async function initialize() {
-  try {
-    const current = await fetch("./dashboard-data.json").then(response => response.json());
-    state.storeStatus = current.storeStatus;
-  } catch {
-    setStatus($("parseStatus"), "无法读取现有营业门店表，请刷新页面后重试。", "error");
-  }
   $("ownerInput").value = localStorage.getItem("fml-github-owner") || "";
   $("repoInput").value = localStorage.getItem("fml-github-repo") || "fml-999-dashboard";
   $("branchInput").value = localStorage.getItem("fml-github-branch") || "main";
 }
 
 $("fileInput").addEventListener("change", event => handleFile(event.target.files[0]));
+$("unlockDataButton").addEventListener("click", unlockCurrentData);
 $("downloadButton").addEventListener("click", downloadData);
 $("publishButton").addEventListener("click", publish);
 const dropZone = $("dropZone");
