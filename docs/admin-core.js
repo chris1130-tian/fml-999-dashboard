@@ -37,6 +37,25 @@ const monthText = (value) => `${value.getFullYear()}-${pad(value.getMonth() + 1)
 const dateOnlyText = (value) => `${value.getFullYear()}-${pad(value.getMonth() + 1)}-${pad(value.getDate())}`;
 const displayNumber = (value) => Number.isInteger(value) ? String(value) : String(value);
 
+function stableHash(value) {
+  const bytes = new TextEncoder().encode(String(value));
+  let hash = 1469598103934665603n;
+  for (const byte of bytes) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * 1099511628211n);
+  }
+  return hash.toString(36).padStart(13, "0");
+}
+
+function stableUserId(user) {
+  return `U${stableHash(`fml-dashboard-user-v2|${user}`)}`;
+}
+
+function orderIdentity(row, paidText) {
+  const identityIndexes = [5, 8, 16, 19, 21, 30, 31, 32];
+  return `O${stableHash(identityIndexes.map(index => index === 19 ? paidText : cleanText(row[index])).join("|"))}`;
+}
+
 function isLimited(row) {
   return [3, 4, 28].map(index => cleanText(row[index]).toLowerCase()).join("|").includes("限次");
 }
@@ -88,7 +107,52 @@ export async function parseOrderWorkbook(file) {
   return { fileName: file.name, headers, rows: rows.slice(1), sheetName: workbook.SheetNames[0] };
 }
 
-export function buildDashboardData(parsed, storeStatus, overrides = {}) {
+function rebuildPayload(orders, storeStatus, mergeInfo = {}) {
+  const sortedOrders = [...orders].sort((left, right) => left.dt.localeCompare(right.dt) || left.oid.localeCompare(right.oid));
+  const byUser = new Map();
+  sortedOrders.forEach(order => {
+    if (!byUser.has(order.u)) byUser.set(order.u, []);
+    byUser.get(order.u).push(order);
+  });
+
+  const cohorts = [];
+  for (const userOrders of byUser.values()) {
+    const first = userOrders.find(order => order.new);
+    if (!first) continue;
+    const next = userOrders.find(order => order.oid !== first.oid && (order.dt > first.dt || (order.dt === first.dt && order.oid > first.oid)));
+    let days = null;
+    if (next) {
+      const firstDay = new Date(first.dt.slice(0, 10));
+      const nextDay = new Date(next.dt.slice(0, 10));
+      days = Math.floor((nextDay.getTime() - firstDay.getTime()) / 86400000);
+    }
+    cohorts.push({
+      m: first.m, c: first.c, sid: first.sid, s: first.s, u: first.u, a: first.a,
+      t: first.t, n: first.n, dt: first.dt, d: days, st: next?.t ?? null,
+      p: next ? `${first.t}→${next.t}` : null,
+    });
+  }
+
+  const dateMin = sortedOrders[0]?.dt ?? "";
+  const dateMax = sortedOrders.at(-1)?.dt ?? "";
+  const latest = dateMax ? dateMax.slice(0, 10) : "—";
+  return {
+    meta: {
+      schemaVersion: 2,
+      dateMin,
+      dateMax,
+      source: "线上历史数据与新增订单合并（匿名化、加密存储）",
+      generatedAt: dateTimeText(new Date()).replace(" ", "T"),
+      warning: `当前线上数据覆盖${dateMin ? dateMin.slice(0, 10) : "—"}至${latest}；经营指标仅统计非预售、主营、已支付且非体验订单。`,
+      mergeInfo,
+    },
+    orders: sortedOrders,
+    cohorts,
+    storeStatus: { ...storeStatus, source: "营业门店表" },
+  };
+}
+
+export function buildDashboardData(parsed, storeStatus, overrides = {}, currentData = null) {
   const records = [];
   let dateMin = null;
   let dateMax = null;
@@ -108,68 +172,70 @@ export function buildDashboardData(parsed, storeStatus, overrides = {}) {
     const isExperience = cleanText(row[17]).includes("体验") || cleanText(row[17]).includes("赠送");
     const valid = Boolean(isPaid && isMain && amount > 0 && !isPresale && !isExperience);
     const isNew = Boolean(valid && cleanText(row[33]) === "同商户拉新订单");
+    const paidText = dateTimeText(paidAt);
     records.push({
-      sourceRow: offset + 2, paidAt, paidText: dateTimeText(paidAt), month: monthText(paidAt),
+      sourceRow: offset + 2, paidAt, paidText, month: monthText(paidAt), oid: orderIdentity(row, paidText),
       user: cleanText(row[5]), city: cleanText(row[7]), storeId: cleanText(row[8]), store: cleanText(row[9]),
       productId: cleanText(row[16]), product: cleanText(row[17]), amount, subtype: cleanText(row[3]),
       duration: cleanText(row[27]), rights: cleanText(row[28]), days: asNumber(row[31]), times: asNumber(row[32]),
       key, autoTag, tag, basis, valid, isNew, nature: tag === "预售" ? "预售" : (isStoreMonthCard(row) ? "常规999" : "其他常规"),
-      second: null,
     });
   });
 
-  const validByUser = new Map();
-  records.filter(row => row.valid).forEach(row => {
-    if (!validByUser.has(row.user)) validByUser.set(row.user, []);
-    validByUser.get(row.user).push(row);
-  });
-  for (const rows of validByUser.values()) rows.sort((a, b) => a.paidAt - b.paidAt || a.sourceRow - b.sourceRow);
-  records.filter(row => row.isNew).forEach(row => {
-    const next = validByUser.get(row.user)?.find(candidate => candidate.paidAt > row.paidAt || (candidate.paidAt.getTime() === row.paidAt.getTime() && candidate.sourceRow > row.sourceRow));
-    if (next) row.second = { paidText: next.paidText, days: Math.floor((new Date(next.paidAt.getFullYear(), next.paidAt.getMonth(), next.paidAt.getDate()) - new Date(row.paidAt.getFullYear(), row.paidAt.getMonth(), row.paidAt.getDate())) / 86400000), tag: next.tag, product: next.product, path: `${row.tag}→${next.tag}` };
-  });
-
   const pendingMap = new Map();
-  records.filter(row => row.valid && row.month === "2026-08" && row.tag === "待确认").forEach(row => {
+  const uploadLatestMonth = dateMax ? monthText(dateMax) : "";
+  records.filter(row => row.valid && row.month === uploadLatestMonth && row.tag === "待确认").forEach(row => {
     const item = pendingMap.get(row.key) || { key: row.key, productId: row.productId, product: row.product, amount: row.amount, subtype: row.subtype, duration: row.duration, rights: row.rights, days: row.days, times: row.times, basis: row.basis, orders: 0 };
     item.orders += 1;
     pendingMap.set(row.key, item);
   });
 
-  const rawUsers = Array.from(new Set(records.filter(row => row.valid).map(row => row.user))).sort((a, b) => a.localeCompare(b, "zh-CN", { numeric: true }));
-  const anonymousUsers = new Map(rawUsers.map((user, index) => [user, `U${String(index + 1).padStart(7, "0")}`]));
-  const orders = records.filter(row => row.valid).map(row => ({ m: row.month, c: row.city, sid: row.storeId, s: row.store, u: anonymousUsers.get(row.user), a: row.amount, t: row.tag, n: row.nature, new: row.isNew }));
-
-  const firstByUser = new Map();
-  records.filter(row => row.isNew).forEach(row => {
-    const current = firstByUser.get(row.user);
-    if (!current || row.paidAt < current.paidAt || (row.paidAt.getTime() === current.paidAt.getTime() && row.sourceRow < current.sourceRow)) firstByUser.set(row.user, row);
-  });
-  const cohorts = Array.from(firstByUser.values()).map(row => ({
-    m: row.month, c: row.city, sid: row.storeId, s: row.store, u: anonymousUsers.get(row.user), a: row.amount,
-    t: row.tag, n: row.nature, dt: row.paidText, d: row.second?.days ?? null, st: row.second?.tag ?? null, p: row.second?.path ?? null,
+  const incomingOrders = records.filter(row => row.valid).map(row => ({
+    oid: row.oid, dt: row.paidText, m: row.month, c: row.city, sid: row.storeId, s: row.store,
+    u: stableUserId(row.user), a: row.amount, t: row.tag, n: row.nature, new: row.isNew,
   }));
+  const observedOrderIds = new Set(records.map(row => row.oid));
+  const currentOrders = Array.isArray(currentData?.orders) ? currentData.orders : [];
+  const currentIsIncremental = currentData?.meta?.schemaVersion === 2 && currentOrders.every(row => row.oid && row.dt);
+  const currentDateMin = currentData?.meta?.dateMin || "";
+  const uploadDateMin = dateMin ? dateTimeText(dateMin) : "";
+  if (currentOrders.length && !currentIsIncremental) {
+    const looksComplete = uploadDateMin && (!currentDateMin || uploadDateMin.slice(0, 10) <= currentDateMin.slice(0, 10)) && incomingOrders.length >= currentOrders.length * 0.8;
+    if (!looksComplete) throw new Error("首次启用增量更新需要上传一份完整历史订单文件，完成数据结构迁移后即可只上传新增数据。");
+  }
 
-  const latest = dateMax ? dateOnlyText(dateMax) : "—";
-  const normalizedStoreStatus = { ...storeStatus, source: "营业门店表" };
-  const payload = {
-    meta: {
-      dateMin: dateMin ? dateTimeText(dateMin) : "", dateMax: dateMax ? dateTimeText(dateMax) : "",
-      source: "订单数据（浏览器本地处理并匿名化）", generatedAt: dateTimeText(new Date()).replace(" ", "T"),
-      warning: `当前源文件覆盖${dateMin ? dateOnlyText(dateMin) : "—"}至${latest}；经营指标仅统计非预售、主营、已支付且非体验订单，2026年8月为截至${latest}的月内数据。`,
-    },
-    orders, cohorts, storeStatus: normalizedStoreStatus,
-  };
+  const mergedMap = new Map();
+  if (currentIsIncremental) currentOrders.forEach(order => mergedMap.set(order.oid, order));
+  const currentIds = new Set(currentOrders.map(order => order.oid));
+  const incomingIds = new Set(incomingOrders.map(order => order.oid));
+  const replacedOrders = currentIsIncremental ? incomingOrders.filter(order => currentIds.has(order.oid)).length : 0;
+  const addedOrders = currentIsIncremental ? incomingOrders.filter(order => !currentIds.has(order.oid)).length : incomingOrders.length;
+  const removedOrders = currentIsIncremental ? Array.from(observedOrderIds).filter(oid => currentIds.has(oid) && !incomingIds.has(oid)).length : 0;
+  observedOrderIds.forEach(oid => mergedMap.delete(oid));
+  incomingOrders.forEach(order => mergedMap.set(order.oid, order));
+  const mergedOrders = Array.from(mergedMap.values());
+  const mergeMode = currentOrders.length && !currentIsIncremental ? "首次完整迁移" : currentIsIncremental ? "线上增量合并" : "首次建立";
+  const payload = rebuildPayload(mergedOrders, storeStatus, {
+    mode: mergeMode,
+    uploadRows: parsed.rows.length,
+    uploadValidOrders: incomingOrders.length,
+    previousOrders: currentIsIncremental ? currentOrders.length : 0,
+    addedOrders,
+    replacedOrders,
+    removedOrders,
+  });
 
-  const valid = records.filter(row => row.valid);
-  const newUsers = new Set(records.filter(row => row.isNew).map(row => row.user));
+  const valid = payload.orders;
+  const newUsers = new Set(payload.cohorts.map(row => row.u));
+  const latestMonth = payload.meta.dateMax.slice(0, 7);
   const summary = {
     sourceRows: parsed.rows.length, processedRows: records.length, validOrders: valid.length,
-    gmv: valid.reduce((sum, row) => sum + row.amount, 0), newUsers: newUsers.size,
-    pendingOrders: valid.filter(row => row.month === "2026-08" && row.tag === "待确认").length,
+    uploadValidOrders: incomingOrders.length, addedOrders, replacedOrders, removedOrders, mergeMode,
+    gmv: valid.reduce((sum, row) => sum + row.a, 0), newUsers: newUsers.size,
+    pendingOrders: records.filter(row => row.valid && row.month === uploadLatestMonth && row.tag === "待确认").length,
     pendingRules: pendingMap.size, dateMin: payload.meta.dateMin, dateMax: payload.meta.dateMax,
-    oneVOne: valid.filter(row => row.tag === "1V1").length, oneVTwo: valid.filter(row => row.tag === "1V2").length,
-    special999: cohorts.filter(row => row.m === "2026-08" && row.n === "常规999").length,
+    oneVOne: valid.filter(row => row.t === "1V1").length, oneVTwo: valid.filter(row => row.t === "1V2").length,
+    special999: payload.cohorts.filter(row => row.m === latestMonth && row.n === "常规999").length,
   };
   return { payload, summary, pending: Array.from(pendingMap.values()) };
 }

@@ -3,7 +3,7 @@ import { parseOrderWorkbook, buildDashboardData, encryptDashboardData, decryptDa
 const $ = (id) => document.getElementById(id);
 const number = new Intl.NumberFormat("zh-CN");
 const money = new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 0 });
-const state = { parsed: null, result: null, storeStatus: null, overrides: JSON.parse(localStorage.getItem("fml-product-overrides") || "{}") };
+const state = { parsed: null, result: null, currentData: null, storeStatus: null, overrides: JSON.parse(localStorage.getItem("fml-product-overrides") || "{}") };
 
 function setStatus(element, message, type = "") {
   element.textContent = message;
@@ -20,8 +20,13 @@ function renderResult() {
   $("publishSection").classList.remove("hidden");
   $("summaryCards").innerHTML = [
     summaryCard("数据范围", `${summary.dateMin.slice(0, 10)} 至 ${summary.dateMax.slice(0, 10)}`),
-    summaryCard("有效私教订单", number.format(summary.validOrders)),
-    summaryCard("有效私教GMV", money.format(summary.gmv)),
+    summaryCard("合并方式", summary.mergeMode),
+    summaryCard("本次有效订单", number.format(summary.uploadValidOrders)),
+    summaryCard("本次新增订单", number.format(summary.addedOrders)),
+    summaryCard("历史更新订单", number.format(summary.replacedOrders)),
+    summaryCard("失效移除订单", number.format(summary.removedOrders), summary.removedOrders > 0),
+    summaryCard("合并后私教订单", number.format(summary.validOrders)),
+    summaryCard("合并后私教GMV", money.format(summary.gmv)),
     summaryCard("拉新用户", number.format(summary.newUsers)),
     summaryCard("1V1订单", number.format(summary.oneVOne)),
     summaryCard("1V2订单", number.format(summary.oneVTwo)),
@@ -54,7 +59,7 @@ function escapeHtml(value) {
 }
 
 function recalculate() {
-  state.result = buildDashboardData(state.parsed, state.storeStatus, state.overrides);
+  state.result = buildDashboardData(state.parsed, state.storeStatus, state.overrides, state.currentData);
   renderResult();
 }
 
@@ -71,7 +76,7 @@ async function handleFile(file) {
   try {
     state.parsed = await parseOrderWorkbook(file);
     recalculate();
-    setStatus($("parseStatus"), `已读取 ${number.format(state.parsed.rows.length)} 行数据，列结构校验通过。`, "success");
+    setStatus($("parseStatus"), `已读取 ${number.format(state.parsed.rows.length)} 行数据，并与线上历史数据完成增量合并。`, "success");
   } catch (error) {
     state.parsed = null;
     state.result = null;
@@ -85,6 +90,13 @@ function utf8Base64(text) {
   const chunk = 0x8000;
   for (let index = 0; index < bytes.length; index += chunk) binary += String.fromCharCode(...bytes.subarray(index, index + chunk));
   return btoa(binary);
+}
+
+function base64Utf8(value) {
+  const clean = String(value || "").replace(/\s/g, "");
+  const binary = atob(clean);
+  const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
 }
 
 async function githubRequest(url, token, options = {}) {
@@ -115,17 +127,26 @@ async function publish() {
   setStatus($("publishStatus"), "正在连接GitHub并更新看板数据…");
   try {
     const path = "docs/dashboard-data.enc.json";
-    const base = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path}`;
-    let sha = null;
-    const existingResponse = await fetch(`${base}?ref=${encodeURIComponent(branch)}`, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${token}`, "X-GitHub-Api-Version": "2022-11-28" } });
-    if (existingResponse.ok) sha = (await existingResponse.json()).sha;
-    else if (existingResponse.status !== 404) throw new Error((await existingResponse.json().catch(() => ({}))).message || `无法读取现有数据文件（${existingResponse.status}）`);
+    const repoBase = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+    const base = `${repoBase}/contents/${path}`;
+    const existingInfo = await githubRequest(`${base}?ref=${encodeURIComponent(branch)}`, token);
+    const existingBlob = await githubRequest(`${repoBase}/git/blobs/${existingInfo.sha}`, token);
+    const onlineCurrent = await decryptDashboardData(JSON.parse(base64Utf8(existingBlob.content)), dataPassword);
+    state.currentData = onlineCurrent;
+    state.storeStatus = onlineCurrent.storeStatus;
+    state.result = buildDashboardData(state.parsed, state.storeStatus, state.overrides, onlineCurrent);
+    if (state.result.pending.length) throw new Error("线上合并后仍有待确认订单，请完成确认后再发布");
+    renderResult();
     const encryptedPayload = await encryptDashboardData(state.result.payload, dataPassword);
     const body = { message: `更新加密经营看板数据至 ${state.result.summary.dateMax.slice(0, 10)}`, content: utf8Base64(JSON.stringify(encryptedPayload)), branch };
-    if (sha) body.sha = sha;
-    await githubRequest(base, token, { method: "PUT", body: JSON.stringify(body) });
+    body.sha = existingInfo.sha;
+    const published = await githubRequest(base, token, { method: "PUT", body: JSON.stringify(body) });
+    setStatus($("publishStatus"), "数据已提交，正在从GitHub线上回读校验…");
+    const verifiedBlob = await githubRequest(`${repoBase}/git/blobs/${published.content.sha}`, token);
+    const verified = await decryptDashboardData(JSON.parse(base64Utf8(verifiedBlob.content)), dataPassword);
+    if (verified.meta.generatedAt !== state.result.payload.meta.generatedAt || verified.orders.length !== state.result.payload.orders.length) throw new Error("线上回读结果与本次数据不一致");
     $("tokenInput").value = "";
-    setStatus($("publishStatus"), "发布成功。GitHub Pages通常会在1—3分钟内完成更新，请稍后刷新公开看板。", "success");
+    setStatus($("publishStatus"), `发布并在线校验成功：线上共${number.format(verified.orders.length)}笔订单，数据截至${verified.meta.dateMax.slice(0, 10)}。GitHub Pages通常会在1—3分钟内刷新。`, "success");
   } catch (error) {
     setStatus($("publishStatus"), `${error.message || "发布失败"}。请检查令牌是否仅授权当前仓库，并拥有Contents读写权限。`, "error");
   } finally {
@@ -153,14 +174,16 @@ async function unlockCurrentData() {
   $("unlockDataButton").disabled = true;
   setStatus($("unlockStatus"), "正在验证密码并读取营业门店表…");
   try {
-    const envelope = await fetch("./dashboard-data.enc.json", { cache: "no-store" }).then(response => {
+    const envelope = await fetch(`./dashboard-data.enc.json?v=${Date.now()}`, { cache: "no-store" }).then(response => {
       if (!response.ok) throw new Error("加密数据文件加载失败");
       return response.json();
     });
     const current = await decryptDashboardData(envelope, password);
+    state.currentData = current;
     state.storeStatus = current.storeStatus;
-    setStatus($("unlockStatus"), `密码验证成功，已读取${current.storeStatus.stores.filter(row => row.operating).length}家营业中门店。`, "success");
+    setStatus($("unlockStatus"), `密码验证成功，已在线读取${number.format(current.orders.length)}笔历史订单和${current.storeStatus.stores.filter(row => row.operating).length}家营业中门店。`, "success");
   } catch {
+    state.currentData = null;
     state.storeStatus = null;
     setStatus($("unlockStatus"), "密码不正确，请重新输入。", "error");
   } finally {
